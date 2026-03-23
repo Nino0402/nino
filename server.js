@@ -51,7 +51,7 @@ app.post('/overlay', upload.single('image'), async (req, res) => {
     const maxChars = Math.floor(imgWidth * 0.034);
     const lines    = wrapText(text, maxChars);
 
-    const textWidth = Math.round(imgWidth * 0.82);
+    const textWidth = Math.round(imgWidth * 0.65);
     const boxWidth  = textWidth + paddingX * 2;
     const boxHeight = lines.length * lineHeight + paddingY * 2;
 
