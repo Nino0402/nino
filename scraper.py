@@ -28,6 +28,7 @@ import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from deliver import deliver
+from notify import alert_cookie_expired, alert_no_results, alert_error, alert_success
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
@@ -400,7 +401,24 @@ def main():
     max_pages     = args.max_pages
     headless      = args.headless
     export_dt     = datetime.now()
+    sheets_id     = _env("SHEETS_ID")
     all_props: list[dict] = []
+
+    try:
+        _run(args, cookie, listings_url, since_hours, output_file, delay,
+             max_pages, headless, export_dt, sheets_id, all_props)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        import traceback
+        msg = traceback.format_exc()
+        print(f"\nEROARE NEAȘTEPTATĂ:\n{msg}")
+        alert_error(msg)
+        sys.exit(2)
+
+
+def _run(args, cookie, listings_url, since_hours, output_file, delay,
+         max_pages, headless, export_dt, sheets_id, all_props):
 
     print("=" * 60)
     print("  CRM REBS Scraper – mod zilnic")
@@ -439,6 +457,7 @@ def main():
 
             if "login" in page.url.lower() or "signin" in page.url.lower():
                 print("  Cookie expirat — redirecționat la login. Oprire.")
+                alert_cookie_expired()
                 sys.exit(1)
 
             rows = page.locator("tbody tr").all()
@@ -525,12 +544,16 @@ def main():
 
     if not all_props:
         print("Nicio proprietate nouă. Nu se exportă nimic.")
+        alert_no_results(since_hours)
         return
 
     if args.output:
         export_excel(all_props, output_file, export_dt)
 
     deliver(output_file if args.output else "", len(all_props), export_dt, properties=all_props)
+
+    with_phone = sum(1 for p in all_props if p.get("Telefon"))
+    alert_success(len(all_props), with_phone, sheets_id)
 
 
 if __name__ == "__main__":
