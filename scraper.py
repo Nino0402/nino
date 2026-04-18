@@ -1,14 +1,19 @@
 """
-CRM REBS – Playwright scraper
-==============================
-- Citește datele direct din tabelul de listing (ID, tip, locatie, pret)
-- Dă click pe butonul "Detalii" al fiecărei proprietăți
-- Extrage telefonul de pe pagina de detalii
-- Se întoarce și continuă cu următoarea
+CRM REBS – Playwright scraper (mod zilnic)
+==========================================
+Rulează zilnic la 05:00 ora României, colectează proprietățile postate
+în ultimele 24 de ore și le adaugă în Google Sheets.
 
 Usage:
-    python scraper.py --cookie "YOUR_COOKIE_STRING"
-    set REBS_COOKIE=your_cookie && python scraper.py --headless
+    python scraper.py --cookie "YOUR_COOKIE_STRING" --headless
+    python scraper.py --url "https://..." --since-hours 24
+
+Variabile de mediu (sau .env):
+    REBS_COOKIE       – șirul de cookie din browser
+    REBS_URL          – URL-ul paginii cu filtrele dorite
+    DELIVER_SHEETS=1
+    GOOGLE_SA_JSON    – calea spre service_account.json
+    SHEETS_ID         – ID-ul spreadsheet-ului Google
 """
 
 import argparse
@@ -16,7 +21,7 @@ import os
 import sys
 import time
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
 import openpyxl
@@ -26,8 +31,8 @@ from deliver import deliver
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
-LISTINGS_URL = "https://mervani-imobiliare.crmrebs.com/market-snapshot/listings"
-DOMAIN       = "mervani-imobiliare.crmrebs.com"
+DEFAULT_URL = "https://mervani-imobiliare.crmrebs.com/market-snapshot/listings"
+DOMAIN      = "mervani-imobiliare.crmrebs.com"
 
 COLUMN_NAMES = [
     "ID",
@@ -44,24 +49,45 @@ COLUMN_NAMES = [
     "Link",
 ]
 
+MONTHS = {
+    "ian": 1, "jan": 1, "feb": 2, "mar": 3, "apr": 4,
+    "mai": 5, "may": 5, "iun": 6, "jun": 6, "iul": 7, "jul": 7,
+    "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+# Fusul orar România (Europe/Bucharest) — UTC+2 iarna, UTC+3 vara.
+# Folosim utcnow() + comparăm naive, suficient pentru precizie de 1h.
+RO_UTC_OFFSET = 3  # EEST (vara); schimbă în 2 iarna dacă e necesar
+
 # ── CLI / env ──────────────────────────────────────────────────────────────
 
+def _env(key: str, default: str = "") -> str:
+    return os.environ.get(key, default).strip()
+
+
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--cookie",    default="", help="Cookie header string")
-    p.add_argument("--output",    default="", help="Fișier .xlsx output")
-    p.add_argument("--delay",     type=float, default=0.8)
-    p.add_argument("--max-pages", type=int,   default=200)
-    p.add_argument("--headless",  action="store_true")
+    p = argparse.ArgumentParser(description="REBS daily scraper")
+    p.add_argument("--cookie",       default="",   help="Cookie header string")
+    p.add_argument("--url",          default="",   help="URL listing cu filtre")
+    p.add_argument("--output",       default="",   help="Fișier .xlsx output (opțional)")
+    p.add_argument("--delay",        type=float, default=0.8)
+    p.add_argument("--max-pages",    type=int,   default=200)
+    p.add_argument("--since-hours",  type=int,   default=24,
+                   help="Colectează doar proprietăți din ultimele N ore (0 = toate)")
+    p.add_argument("--headless",     action="store_true")
     return p.parse_args()
 
 
 def get_cookie(args) -> str:
-    cookie = args.cookie or os.environ.get("REBS_COOKIE", "")
+    cookie = args.cookie or _env("REBS_COOKIE")
     if not cookie:
         print("EROARE: cookie lipsește. Folosește --cookie sau REBS_COOKIE.")
         sys.exit(1)
     return cookie
+
+
+def get_listings_url(args) -> str:
+    return args.url or _env("REBS_URL") or DEFAULT_URL
 
 
 def parse_cookies(cookie_str: str) -> list[dict]:
@@ -85,6 +111,43 @@ def clean(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+def parse_publish_date(text: str) -> datetime | None:
+    """
+    Parsează formatul "17 Apr '26 20:21" → datetime naiv în ora României.
+    Returnează None dacă formatul nu e recunoscut.
+    """
+    text = text.strip()
+    m = re.match(r"(\d{1,2})\s+(\w{3})\s+'(\d{2})\s+(\d{2}):(\d{2})", text)
+    if not m:
+        return None
+    day, mon_str, yr2, hr, mn = m.groups()
+    month = MONTHS.get(mon_str.lower())
+    if not month:
+        return None
+    year = 2000 + int(yr2)
+    try:
+        return datetime(year, month, int(day), int(hr), int(mn))
+    except ValueError:
+        return None
+
+
+def is_recent(date_text: str, since_hours: int) -> bool | None:
+    """
+    True  = proprietatea e în fereastra de timp
+    False = proprietatea e mai veche
+    None  = data nu a putut fi parsată (include-o oricum)
+    """
+    if since_hours <= 0:
+        return True
+    dt = parse_publish_date(date_text)
+    if dt is None:
+        return None
+    # "acum" în ora României
+    now_ro = datetime.utcnow() + timedelta(hours=RO_UTC_OFFSET)
+    cutoff = now_ro - timedelta(hours=since_hours)
+    return dt >= cutoff
+
+
 def extract_phone(text: str) -> str:
     patterns = [
         r"\+40\s*7\d{2}[\s.\-]?\d{3}[\s.\-]?\d{3}",
@@ -100,8 +163,6 @@ def extract_phone(text: str) -> str:
 
 
 def parse_price(text: str) -> tuple[str, str]:
-    """Returnează (valoare_numerica, valuta)."""
-    # Ex: "39,000 €", "353 € / lună", "135.000 €"
     m = re.search(r"([\d\s,.]+)\s*(€|EUR|RON|Lei|\$)", text, re.IGNORECASE)
     if m:
         val    = re.sub(r"[\s,.]", "", m.group(1))
@@ -111,18 +172,11 @@ def parse_price(text: str) -> tuple[str, str]:
 
 
 def parse_tip_and_tranzactie(text: str) -> tuple[str, str, str, str]:
-    """
-    Din textul coloanei "Tip proprietate / Caracteristici" extrage:
-    (tip_proprietate, tip_tranzactie, camere, suprafata)
-
-    Ex: "Casă / Vilă cu 2 camere de vânzare\nS.U. 107 mp · S.T. 47"
-    """
     tip = ""
     tranzactie = ""
     camere = ""
     suprafata = ""
 
-    # Tip proprietate
     for t in ["Apartament", "Casă", "Casa", "Vilă", "Vila", "Teren",
               "Spațiu comercial", "Spatiu comercial", "Garsonieră", "Garsoniera",
               "Duplex", "Penthouse", "Birou", "Depozit", "Hală", "Hala"]:
@@ -130,18 +184,15 @@ def parse_tip_and_tranzactie(text: str) -> tuple[str, str, str, str]:
             tip = t.replace("ă", "a").replace("î", "i").replace("â", "a").replace("ș", "s").replace("ț", "t")
             break
 
-    # Tip tranzactie
     if re.search(r"vânzare|vanzare", text, re.I):
         tranzactie = "Vanzare"
     elif re.search(r"închiriat|inchiriat|închiriere|inchiriere", text, re.I):
         tranzactie = "Inchiriere"
 
-    # Camere
     m = re.search(r"(\d+)\s*camere?", text, re.I)
     if m:
         camere = m.group(1)
 
-    # Suprafata utila (S.U.)
     m = re.search(r"S\.U\.?\s*([\d,\.]+)\s*mp", text, re.I)
     if m:
         suprafata = m.group(1).replace(",", ".")
@@ -154,11 +205,6 @@ def parse_tip_and_tranzactie(text: str) -> tuple[str, str, str, str]:
 
 
 def parse_location(text: str) -> tuple[str, str]:
-    """
-    Din textul coloanei Locație extrage (localitate, judet).
-    Ex: "Mihai Bravu, Ploiești, jud. Prahova"  → ("Ploiești", "Prahova")
-    Ex: "Breaza, jud. Prahova"                  → ("Breaza", "Prahova")
-    """
     judet = ""
     localitate = ""
 
@@ -166,11 +212,10 @@ def parse_location(text: str) -> tuple[str, str]:
     if m:
         judet = m.group(1)
 
-    # Elimină "jud. Prahova" și ia ultima parte ca localitate
     loc_text = re.sub(r",?\s*jud\.?\s*[A-ZĂÎÂȘȚ][a-zăîâșț\-]+", "", text).strip()
     parts = [p.strip() for p in loc_text.split(",") if p.strip()]
     if parts:
-        localitate = parts[-1]  # ultima parte = orașul/comuna
+        localitate = parts[-1]
 
     return localitate, judet
 
@@ -178,10 +223,6 @@ def parse_location(text: str) -> tuple[str, str]:
 # ── Scraping pagina de listing ─────────────────────────────────────────────
 
 def scrape_listing_row(row) -> dict:
-    """
-    Extrage datele direct din rândul tabelului de listing, fără să intre pe detalii.
-    Returnează dict cu toate câmpurile disponibile (telefon va fi "" până la detalii).
-    """
     prop = {k: "" for k in COLUMN_NAMES}
 
     try:
@@ -189,14 +230,8 @@ def scrape_listing_row(row) -> dict:
         if len(cells) < 5:
             return prop
 
-        # Coloana 0: checkbox (ignoră)
-        # Coloana 1: ID
-        id_text = clean(cells[1].inner_text())
-        prop["ID"] = id_text  # ex: AP1606137
+        prop["ID"] = clean(cells[1].inner_text())
 
-        # Coloana 2: Imagini (ignoră)
-
-        # Coloana 3: Tip proprietate / Caracteristici
         tip_text = clean(cells[3].inner_text())
         tip, tranzactie, camere, suprafata = parse_tip_and_tranzactie(tip_text)
         prop["Tip Proprietate"] = tip
@@ -204,20 +239,16 @@ def scrape_listing_row(row) -> dict:
         prop["Camere"]          = camere
         prop["Suprafata (mp)"]  = suprafata
 
-        # Coloana 4: Zile piață / Ultima modif.
         data_text = clean(cells[4].inner_text())
-        # Ex: "19 minute\n17 Apr '26 20:21"
         lines = [l.strip() for l in data_text.split("\n") if l.strip()]
         if len(lines) >= 2:
-            prop["Data Publicare"] = lines[1]  # "17 Apr '26 20:21"
+            prop["Data Publicare"] = lines[1]
 
-        # Coloana 5: Locație
         loc_text = clean(cells[5].inner_text())
         localitate, judet = parse_location(loc_text)
         prop["Localitate"] = localitate
         prop["Judet"]      = judet
 
-        # Coloana 6: Preț
         pret_text = clean(cells[6].inner_text())
         prop["Pret"], prop["Valuta"] = parse_price(pret_text)
 
@@ -230,18 +261,12 @@ def scrape_listing_row(row) -> dict:
 # ── Scraping pagina de detalii ─────────────────────────────────────────────
 
 def scrape_detail_for_phone(page: Page) -> tuple[str, str]:
-    """
-    Pe pagina de detalii, caută numărul de telefon și link-ul.
-    Returnează (telefon, url_curent).
-    """
     url   = page.url
     phone = ""
 
-    # Așteaptă să se încarce pagina
     page.wait_for_timeout(1000)
     full_text = clean(page.inner_text("body") or "")
 
-    # 1. Link tel:
     tel_links = page.locator("a[href^='tel:']").all()
     if tel_links:
         try:
@@ -250,7 +275,6 @@ def scrape_detail_for_phone(page: Page) -> tuple[str, str]:
         except Exception:
             pass
 
-    # 2. Click buton "afișează telefon" dacă există
     if not phone:
         btn_selectors = [
             "button:has-text('Telefon')",
@@ -273,7 +297,6 @@ def scrape_detail_for_phone(page: Page) -> tuple[str, str]:
             except Exception:
                 continue
 
-    # 3. Regex în text
     if not phone:
         phone = extract_phone(full_text)
 
@@ -282,38 +305,7 @@ def scrape_detail_for_phone(page: Page) -> tuple[str, str]:
 
 # ── Paginare ───────────────────────────────────────────────────────────────
 
-def get_total_pages(page: Page) -> int:
-    """Detectează numărul total de pagini din text-ul de paginare."""
-    try:
-        # Ex: "Pagina 1, 100+ rezultate" sau "Pagina 1 din 5"
-        pag_text = clean(page.locator("text=/[Pp]agina/").first.inner_text())
-        m = re.search(r"din\s+(\d+)", pag_text, re.I)
-        if m:
-            return int(m.group(1))
-    except Exception:
-        pass
-
-    # Caută linkuri numerice în paginare
-    try:
-        links = page.locator(".pagination a, nav a").all()
-        nums = []
-        for a in links:
-            try:
-                t = clean(a.inner_text())
-                if t.isdigit():
-                    nums.append(int(t))
-            except Exception:
-                continue
-        if nums:
-            return max(nums)
-    except Exception:
-        pass
-
-    return 1
-
-
 def has_next_page(page: Page, current: int) -> bool:
-    """Verifică dacă există o pagină următoare."""
     selectors = [
         "a[rel='next']",
         f"a[href*='page={current + 1}']",
@@ -399,20 +391,24 @@ def export_excel(properties: list[dict], filepath: str, export_dt: datetime):
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main():
-    args        = parse_args()
-    cookie      = get_cookie(args)
-    output_file = args.output or f"rebs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-    delay       = args.delay
-    max_pages   = args.max_pages
-    headless    = args.headless
-    export_dt   = datetime.now()
+    args          = parse_args()
+    cookie        = get_cookie(args)
+    listings_url  = get_listings_url(args)
+    since_hours   = args.since_hours
+    output_file   = args.output or f"rebs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    delay         = args.delay
+    max_pages     = args.max_pages
+    headless      = args.headless
+    export_dt     = datetime.now()
     all_props: list[dict] = []
 
     print("=" * 60)
-    print("  CRM REBS Scraper")
+    print("  CRM REBS Scraper – mod zilnic")
     print("=" * 60)
-    print(f"  Output:   {output_file}")
-    print(f"  Headless: {'DA' if headless else 'NU'}")
+    print(f"  URL:          {listings_url}")
+    print(f"  Ultimele:     {since_hours}h  (0 = toate)")
+    print(f"  Output:       {output_file}")
+    print(f"  Headless:     {'DA' if headless else 'NU'}")
     print()
 
     with sync_playwright() as pw:
@@ -428,9 +424,10 @@ def main():
         page = context.new_page()
 
         current_page = 1
+        stop_pagination = False  # setat True când am ieșit din fereastra de 24h
 
-        while current_page <= max_pages:
-            listing_url = LISTINGS_URL if current_page == 1 else f"{LISTINGS_URL}?page={current_page}"
+        while current_page <= max_pages and not stop_pagination:
+            listing_url = listings_url if current_page == 1 else f"{listings_url}{'&' if '?' in listings_url else '?'}page={current_page}"
             print(f"\n── Pagina {current_page} ──────────────────────────────────────")
 
             try:
@@ -444,10 +441,6 @@ def main():
                 print("  Cookie expirat — redirecționat la login. Oprire.")
                 sys.exit(1)
 
-            # ── Pasul 1: colectează toate datele + URL-urile din tabel ──────
-            # Facem asta ÎNAINTE de orice navigare, cât pagina e intactă.
-            page_entries: list[dict] = []
-
             rows = page.locator("tbody tr").all()
             if not rows:
                 print("  Niciun rând găsit. Ultima pagină.")
@@ -455,12 +448,23 @@ def main():
 
             print(f"  {len(rows)} proprietăți — colectez datele din tabel...")
 
+            page_entries: list[dict] = []
             for row in rows:
                 prop = scrape_listing_row(row)
                 if not prop.get("ID"):
                     continue
 
-                # Extrage URL-ul butonului Detalii din HTML (fără click)
+                # ── Filtrare după dată ──────────────────────────────────────
+                date_text = prop.get("Data Publicare", "")
+                recent = is_recent(date_text, since_hours)
+
+                if recent is False:
+                    # Dacă lista e sortată newest-first, putem opri paginarea.
+                    # Dacă nu e sortată, comentează linia de mai jos.
+                    print(f"  Proprietate mai veche de {since_hours}h ({date_text}) — opresc paginarea.")
+                    stop_pagination = True
+                    break
+
                 try:
                     btn = row.locator("a:has-text('Detalii')").first
                     href = btn.get_attribute("href") or ""
@@ -472,17 +476,16 @@ def main():
 
                 page_entries.append(prop)
 
-            print(f"  {len(page_entries)} proprietăți valide. Intru pe fiecare...")
+            print(f"  {len(page_entries)} proprietăți recente pe această pagină.")
 
-            # ── Pasul 2: navighează la fiecare URL de detalii ───────────────
-            # Nu mai folosim go_back() — navigăm direct prin URL.
             for i, prop in enumerate(page_entries, start=1):
                 detail_url = prop.get("Link", "")
 
                 print(f"  [{i}/{len(page_entries)}] {prop['ID']} — "
                       f"{prop.get('Tip Proprietate','?')} | "
                       f"{prop.get('Pret','')} {prop.get('Valuta','')} | "
-                      f"{prop.get('Localitate','')}, {prop.get('Judet','')}")
+                      f"{prop.get('Localitate','')}, {prop.get('Judet','')} | "
+                      f"{prop.get('Data Publicare','')}")
 
                 if detail_url:
                     try:
@@ -501,8 +504,9 @@ def main():
 
             print(f"  Total acumulat: {len(all_props)}")
 
-            # ── Pasul 3: verifică dacă există pagina următoare ──────────────
-            # Reîncarcă pagina de listing pentru a verifica paginarea
+            if stop_pagination:
+                break
+
             page.goto(listing_url, wait_until="domcontentloaded", timeout=20000)
             page.wait_for_timeout(1000)
 
@@ -515,12 +519,18 @@ def main():
         browser.close()
 
     print(f"\n{'=' * 60}")
-    print(f"  Total: {len(all_props)} proprietăți")
+    print(f"  Total proprietăți noi (ultimele {since_hours}h): {len(all_props)}")
     print(f"  Cu telefon: {sum(1 for p in all_props if p.get('Telefon'))}")
     print(f"{'=' * 60}\n")
 
-    export_excel(all_props, output_file, export_dt)
-    deliver(output_file, len(all_props), export_dt, properties=all_props)
+    if not all_props:
+        print("Nicio proprietate nouă. Nu se exportă nimic.")
+        return
+
+    if args.output:
+        export_excel(all_props, output_file, export_dt)
+
+    deliver(output_file if args.output else "", len(all_props), export_dt, properties=all_props)
 
 
 if __name__ == "__main__":
