@@ -1,0 +1,19 @@
+[Unit]
+Description=REBS daily property scraper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=%i
+WorkingDirectory=/home/%i/nino
+EnvironmentFile=/home/%i/nino/.env
+ExecStart=/home/%i/nino/venv/bin/python scraper.py --headless --since-hours 24
+StandardOutput=append:/home/%i/nino/logs/scraper.log
+StandardError=append:/home/%i/nino/logs/scraper.log
+
+# Repornire automată dacă eșuează (max 3 încercări)
+Restart=on-failure
+RestartSec=60
+StartLimitIntervalSec=300
+StartLimitBurst=3

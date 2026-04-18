@@ -1,0 +1,14 @@
+[Unit]
+Description=Pornește REBS scraper zilnic la 05:00 ora României
+
+[Timer]
+# 05:00 ora României indiferent de ora de vară/iarnă
+OnCalendar=*-*-* 05:00:00
+TimeZone=Europe/Bucharest
+# Dacă VPS-ul era oprit la 05:00, rulează imediat la repornire
+Persistent=true
+# Toleranță mică — pornește exact la 05:00, nu cu întârzieri aleatorii
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

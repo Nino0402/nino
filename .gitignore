@@ -172,3 +172,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# REBS scraper
+logs/
+*.xlsx
+service_account.json
